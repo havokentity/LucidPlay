@@ -1,12 +1,13 @@
 from dataclasses import dataclass, field
 import sys
 
-FRAME_W = 160
-FRAME_H = 96
+FRAME_W = 320
+FRAME_H = 192
 FRAME_C = 3
 STATE_DIM = 8
 
-UPSAMPLE_CHANNELS = (256, 192, 128, 96, 64, 32)
+# Seven channels = six upsample stages: 5×2^6 = 320, 3×2^6 = 192.
+UPSAMPLE_CHANNELS = (256, 192, 160, 128, 96, 64, 32)
 BASE_W = 5
 BASE_H = 3
 

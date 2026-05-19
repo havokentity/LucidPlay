@@ -193,14 +193,17 @@ def run(cfg: TrainConfig) -> None:
 
     MS_SSIM_cls = _try_import_msssim()
     ms_ssim_module = None
+    ms_ssim_win = 0
     if MS_SSIM_cls is not None:
-        # pytorch-msssim hardcodes a (win_size-1)*2^4 size check regardless of
-        # how many `weights` you pass. With FRAME_H=96, win_size=11 needs >160
-        # (fails) and win_size=7 needs >96 (fails — equal). win_size=5 needs
-        # >64, which passes for our 160×96 frames.
+        # pytorch-msssim hardcodes a (win_size-1)*2^4 size check against the
+        # smaller image dim regardless of how many `weights` you pass. Pick
+        # the largest odd win_size ≤ 11 that fits this resolution.
+        smaller = min(FRAME_W, FRAME_H)
+        ms_ssim_win = max(3, min(11, (smaller // 16) | 1))
         ms_ssim_module = MS_SSIM_cls(
-            data_range=1.0, size_average=True, channel=3, win_size=5,
+            data_range=1.0, size_average=True, channel=3, win_size=ms_ssim_win,
         ).to(device)
+        print(f"[train] MS-SSIM win_size={ms_ssim_win} (frame {FRAME_W}x{FRAME_H})", file=sys.stderr)
 
     start_step = 0
     best_val = float("inf")
