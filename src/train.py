@@ -113,7 +113,13 @@ def run(cfg: TrainConfig) -> None:
     MS_SSIM_cls = _try_import_msssim()
     ms_ssim_module = None
     if MS_SSIM_cls is not None:
-        ms_ssim_module = MS_SSIM_cls(data_range=1.0, size_average=True, channel=3).to(device)
+        # pytorch-msssim hardcodes a (win_size-1)*2^4 size check regardless of
+        # how many `weights` you pass. With FRAME_H=96, win_size=11 needs >160
+        # (fails) and win_size=7 needs >96 (fails — equal). win_size=5 needs
+        # >64, which passes for our 160×96 frames.
+        ms_ssim_module = MS_SSIM_cls(
+            data_range=1.0, size_average=True, channel=3, win_size=5,
+        ).to(device)
 
     start_step = 0
     best_val = float("inf")
