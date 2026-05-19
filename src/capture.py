@@ -113,24 +113,33 @@ def _scripted_states(n: int, seed: int) -> Iterator[WorldState]:
 
     target_x = rng.uniform(0, LEVEL_W)
     plan_ticks = 0
-    state_mode = "walk"  # "walk" | "idle" | "jump_arc"
+    # Mode mix and per-tick jump probability are tuned so airborne states
+    # land at ~30% of the dataset instead of the original ~6%. The model
+    # was under-fitting jumps because they were rare; the side that kept
+    # the player visible only when on_ground=1 was an easy local minimum.
+    state_mode = "walk"  # "walk" | "idle" | "jump_arc" | "standing_jump"
 
     for _ in range(n):
         # Replan periodically.
         plan_ticks -= 1
         if plan_ticks <= 0:
             choice = rng.random()
-            if choice < 0.7:
+            if choice < 0.50:
                 state_mode = "walk"
                 target_x = rng.uniform(0, LEVEL_W)
                 plan_ticks = rng.randint(30, 180)
-            elif choice < 0.9:
+            elif choice < 0.65:
                 state_mode = "idle"
                 plan_ticks = rng.randint(15, 90)
-            else:
+            elif choice < 0.90:
                 state_mode = "jump_arc"
                 target_x = rng.uniform(0, LEVEL_W)
                 plan_ticks = rng.randint(40, 120)
+            else:
+                # In-place hops — covers airborne states with vx ≈ 0
+                # which jump_arc rarely produces.
+                state_mode = "standing_jump"
+                plan_ticks = rng.randint(30, 90)
 
         # Decide input from mode.
         ax = 0.0
@@ -141,7 +150,11 @@ def _scripted_states(n: int, seed: int) -> Iterator[WorldState]:
                 ax = 0.0
         elif state_mode == "jump_arc":
             ax = 1.0 if target_x > px else -1.0
-            if on_ground and rng.random() < 0.05:
+            if on_ground and rng.random() < 0.10:
+                jump = True
+        elif state_mode == "standing_jump":
+            # No horizontal input; jump the moment we land.
+            if on_ground and rng.random() < 0.20:
                 jump = True
         # idle: ax stays 0
 
