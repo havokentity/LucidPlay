@@ -21,7 +21,7 @@ state → ConditionalRenderer → image → WebSocket → <canvas>
 |------|---------|
 | `src/scene.py` | Headless pygame side-scroller (ground-truth, capture-only). |
 | `src/capture.py` | Scripted-motion data dump: writes `frames/*.jpg` + `states.jsonl`. |
-| `src/model.py`   | `ConditionalRenderer`: 8-float state → 160×96 RGB. |
+| `src/model.py`   | `ConditionalRenderer`: 8-float state → 320×192 RGB. |
 | `src/train.py`   | L1 (+ MS-SSIM if available) trainer, AdamW, cosine LR, preview grids. |
 | `src/game_server.py` | asyncio `websockets` server: 60Hz physics + neural render. |
 | `src/viewer/index.html` | Single-file `<canvas>` client with keyboard input + FPS. |
@@ -53,25 +53,29 @@ py -3 -m venv .venv                          # Python 3.11+ (3.13 tested)
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 python scripts\capture.py --out data\sidescroller_v1 --n 20000
-python scripts\train.py  --data data\sidescroller_v1 --out checkpoints\sidescroller_v1.pt --fast
+python scripts\train.py  --data data\sidescroller_v1 --out checkpoints\sidescroller_v1.pt --fast --batch-size 128
 python scripts\serve.py  --ckpt checkpoints\sidescroller_v1.pt
 ```
 
 > PyTorch on Windows installs from the CUDA wheel index. Use **cu128** —
-> required for RTX 50-series (Blackwell, sm_120), and the only stable index
-> that currently ships Python 3.13 wheels. cu128 works on RTX 30/40/50-series.
-> The Mac default wheel already includes MPS. Pygame renders headlessly on
-> both via offscreen `Surface` — no window pops up.
+> required for RTX 50-series (Blackwell, sm_120). On Python 3.13 you
+> additionally need `pip install triton-windows` for `--compile`; cleanest is
+> Python 3.12 where the wheel resolves automatically. The Mac default wheel
+> already includes MPS. Pygame renders headlessly on both via offscreen
+> `Surface` — no window pops up.
 >
 > Verify CUDA was picked up:
 > ```powershell
 > python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 > ```
 
-The `--fast` flag bundles `--cache-data --amp --compile` — on a 5090 a full
-50k-step run lands around **2–4 minutes** (vs ~57 min on Apple Silicon MPS).
-Once you've verified it works you can also bump `--batch-size 128` — the 5090
-has plenty of VRAM headroom at 160×96.
+The `--fast` flag bundles `--cache-data --amp --compile`. At the current
+**320×192** output resolution the cached dataset is ~15 GB and per-step
+compute is ~10× heavier than the original 160×96 POC, so a 50k-step run on a
+5090 lands around **~90 minutes** (vs ~hours on Apple Silicon MPS — Mac is
+inference-only at this resolution). `--batch-size 128` is the recommended
+sweet spot; bumping to 256 fits with ~10 GB headroom if you want faster
+walk-clock per step.
 
 ### Smoke test on tiny data
 
@@ -98,12 +102,14 @@ The flags below opt into bigger wins. CUDA-only flags warn and skip on MPS/CPU.
 | `--fast`          | Shortcut: `--cache-data --amp --compile` (amp/compile auto-disabled on non-CUDA).               | Any           |
 
 TF32 matmul + `cudnn.benchmark` are turned on automatically when CUDA is the
-active device — they're fp32-compatible and free at our fixed 160×96 shape.
+active device — they're fp32-compatible and free at our fixed 320×192 shape.
+MS-SSIM `win_size` is also picked dynamically from the smaller frame dim.
 
-On a 5090: start with `--fast` and consider bumping `--batch-size` (default 32
-leaves the card mostly idle). On M4 Max: `--cache-data` alone is the main win;
-note the cached dataset lives in unified memory, costing ~1 GB at the default
-20 k frames.
+On a 5090: start with `--fast --batch-size 128`. The default batch (32) leaves
+the card mostly idle. On M4 Max: `--cache-data` alone is the main win;
+the cached dataset now costs ~15 GB of unified memory at the default 20 k
+frames + 320×192 resolution, so drop `--cache-data` if your Mac doesn't have
+the room.
 
 ## How it works
 
@@ -111,7 +117,7 @@ note the cached dataset lives in unified memory, costing ~1 GB at the default
    occasionally jumps and idles. For each tick we render the ground-truth
    pygame scene to an offscreen surface and dump `(state_vec, frame.jpg)` pairs.
 2. **Train** (`scripts/train.py`). A small conditional generator
-   (~3M params, 5×3 base → 5 upsamples → 160×96) is fit on those pairs with
+   (~3M params, 5×3 base → 6 upsamples → 320×192) is fit on those pairs with
    `L1 + 0.1·MS-SSIM`. Preview grids of (pred / ground truth) land in
    `checkpoints/preview_*.jpg`.
 3. **Play** (`scripts/serve.py`). The game server runs 60Hz physics, calls
@@ -193,7 +199,7 @@ capture distribution may have changed too. The simplest reset:
 # Windows
 Remove-Item -Recurse -Force data\sidescroller_v1, checkpoints
 python scripts\capture.py --out data\sidescroller_v1 --n 20000
-python scripts\train.py  --data data\sidescroller_v1 --out checkpoints\sidescroller_v1.pt --fast
+python scripts\train.py  --data data\sidescroller_v1 --out checkpoints\sidescroller_v1.pt --fast --batch-size 128
 ```
 
 ```bash
