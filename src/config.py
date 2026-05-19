@@ -42,6 +42,11 @@ class TrainConfig:
     msssim_weight: float = 0.1
     seed: int = 0
     resume: str = ""
+    # Perf knobs. Defaults preserve spec-compliant fp32 behavior on every device.
+    cache_data: bool = False        # pre-decode entire dataset into device memory; bypasses DataLoader workers
+    amp: bool = False               # bf16 autocast on forward+loss. CUDA only; ignored on MPS/CPU.
+    torch_compile: bool = False     # torch.compile the model. CUDA only; ignored on MPS/CPU.
+    channels_last: bool = False     # NHWC memory format. Opt-in; can regress on MPS.
 
 
 @dataclass
