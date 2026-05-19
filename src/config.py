@@ -55,5 +55,5 @@ class ServeConfig:
     ws_port: int = 8765
     static_port: int = 8000
     debug_state: bool = False
-    physics_hz: int = 60
+    tick_hz: int = 60
     jpeg_quality: int = 85
