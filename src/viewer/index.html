@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>LucidPlay — neural renderer</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: #0a0a0c; color: #ddd;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    overflow: hidden;
+  }
+  #wrap {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #000;
+    max-width: 100%; max-height: 100%;
+    width: 96vmin; height: 57.6vmin; /* 160:96 aspect */
+    box-shadow: 0 0 32px rgba(0,0,0,0.6);
+  }
+  #hud {
+    position: fixed; top: 8px; left: 12px;
+    font-size: 12px; color: #aaa; pointer-events: none;
+    text-shadow: 0 1px 0 #000;
+  }
+  #help {
+    position: fixed; bottom: 8px; right: 12px;
+    font-size: 12px; color: #777;
+  }
+  #status {
+    position: fixed; top: 8px; right: 12px;
+    font-size: 12px; color: #888;
+  }
+  .err { color: #ff7a7a; }
+  .ok  { color: #7aff9a; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="screen" width="160" height="96"></canvas></div>
+<div id="hud">LucidPlay <span id="fps">0</span> fps</div>
+<div id="status">connecting…</div>
+<div id="help">← → / A D  •  Space / ↑  jump</div>
+<script>
+(() => {
+  const canvas = document.getElementById('screen');
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  const fpsEl = document.getElementById('fps');
+  const statusEl = document.getElementById('status');
+
+  const wsUrl = `ws://${location.hostname || 'localhost'}:8765`;
+  let ws = null;
+  let lastFrameUrl = null;
+
+  // Track currently-held logical keys.
+  const held = { left: false, right: false, up: false };
+
+  function sendKeys() {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: 'input', keys: { ...held } }));
+  }
+
+  function setKey(name, down) {
+    if (held[name] === down) return;
+    held[name] = down;
+    sendKeys();
+  }
+
+  window.addEventListener('keydown', e => {
+    switch (e.code) {
+      case 'ArrowLeft':  case 'KeyA': setKey('left', true); e.preventDefault(); break;
+      case 'ArrowRight': case 'KeyD': setKey('right', true); e.preventDefault(); break;
+      case 'ArrowUp':    case 'Space': case 'KeyW': setKey('up', true); e.preventDefault(); break;
+    }
+  }, { passive: false });
+  window.addEventListener('keyup', e => {
+    switch (e.code) {
+      case 'ArrowLeft':  case 'KeyA': setKey('left', false); break;
+      case 'ArrowRight': case 'KeyD': setKey('right', false); break;
+      case 'ArrowUp':    case 'Space': case 'KeyW': setKey('up', false); break;
+    }
+  });
+
+  // FPS counter (frames received).
+  let framesThisSec = 0;
+  let lastSec = performance.now();
+  function tickFps(now) {
+    if (now - lastSec >= 1000) {
+      fpsEl.textContent = framesThisSec;
+      framesThisSec = 0;
+      lastSec = now;
+    }
+    requestAnimationFrame(tickFps);
+  }
+  requestAnimationFrame(tickFps);
+
+  function drawBlob(blob) {
+    // createImageBitmap is the fastest path; fall back to <img> if absent.
+    if (window.createImageBitmap) {
+      createImageBitmap(blob).then(bitmap => {
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close && bitmap.close();
+        framesThisSec++;
+      }).catch(() => {});
+    } else {
+      if (lastFrameUrl) URL.revokeObjectURL(lastFrameUrl);
+      lastFrameUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        framesThisSec++;
+      };
+      img.src = lastFrameUrl;
+    }
+  }
+
+  function connect() {
+    statusEl.textContent = 'connecting…';
+    statusEl.className = '';
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      statusEl.textContent = 'connected';
+      statusEl.className = 'ok';
+      sendKeys();
+    };
+    ws.onclose = () => {
+      statusEl.textContent = 'disconnected — retrying';
+      statusEl.className = 'err';
+      setTimeout(connect, 1000);
+    };
+    ws.onerror = () => { /* onclose will handle reconnect */ };
+    ws.onmessage = ev => {
+      if (typeof ev.data === 'string') return; // ignore debug JSON for now
+      drawBlob(new Blob([ev.data], { type: 'image/jpeg' }));
+    };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>
