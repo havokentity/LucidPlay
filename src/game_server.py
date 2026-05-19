@@ -1,8 +1,10 @@
 """WebSocket game server.
 
-Runs a 60Hz physics loop, calls the neural renderer each tick, and streams
-JPEG frames to one viewer. The pygame scene is *not* used here — at play time
-the model is the renderer. We only share geometry constants for collision.
+Runs a configurable tick loop (default 60 Hz, override with --tick-hz) —
+each tick advances simple physics, calls the neural renderer, and streams a
+JPEG frame to one viewer.
+The pygame scene is *not* used here — at play time the model is the renderer.
+We only share geometry constants for collision.
 """
 
 from __future__ import annotations
@@ -143,7 +145,7 @@ class _StaticServer(threading.Thread):
 
 async def _client_loop(ws: WebSocketServerProtocol, sim: _PlayerSim, renderer: Renderer, cfg: ServeConfig) -> None:
     print("[ws] client connected", file=sys.stderr)
-    tick = 1.0 / cfg.physics_hz
+    tick = 1.0 / cfg.tick_hz
     last = time.perf_counter()
 
     async def reader():
@@ -163,6 +165,15 @@ async def _client_loop(ws: WebSocketServerProtocol, sim: _PlayerSim, renderer: R
 
     reader_task = asyncio.create_task(reader())
 
+    # Rolling 1-second timing window. One log line per second so cap behavior
+    # is observable without spamming.
+    render_total = 0.0
+    send_total = 0.0
+    sleep_req_total = 0.0
+    sleep_actual_total = 0.0
+    tick_count = 0
+    t_window_start = time.perf_counter()
+
     try:
         while True:
             now = time.perf_counter()
@@ -175,11 +186,15 @@ async def _client_loop(ws: WebSocketServerProtocol, sim: _PlayerSim, renderer: R
             state = sim.to_state()
             # Renderer call can be heavy on CPU/MPS — run in a thread so we
             # don't starve the event loop.
+            t_render_start = time.perf_counter()
             jpeg = await asyncio.to_thread(renderer.render, state)
+            t_after_render = time.perf_counter()
+            render_total += t_after_render - t_render_start
             try:
                 await ws.send(jpeg)
             except websockets.ConnectionClosed:
                 break
+            send_total += time.perf_counter() - t_after_render
 
             if cfg.debug_state:
                 try:
@@ -187,11 +202,41 @@ async def _client_loop(ws: WebSocketServerProtocol, sim: _PlayerSim, renderer: R
                 except websockets.ConnectionClosed:
                     break
 
-            # Sleep until next tick. Latest-state-wins: if render overran,
-            # skip the sleep and immediately render the next state.
-            sleep_for = tick - (time.perf_counter() - now)
-            if sleep_for > 0:
+            # Wait until next tick boundary. Latest-state-wins: if render
+            # overran, fall through immediately.
+            #
+            # On Windows + ProactorEventLoop, asyncio.sleep(x) ignores x for
+            # sub-15 ms requests unless system timer resolution has been
+            # raised (timeBeginPeriod in main()). The yield-loop after
+            # asyncio.sleep is a safety net that holds the cap even without
+            # that — at worst we yield through the event loop a few times,
+            # which lets the reader task run too.
+            target = now + tick
+            sleep_for = target - time.perf_counter()
+            sleep_req_total += max(0.0, sleep_for)
+            t_sleep_start = time.perf_counter()
+            if sleep_for > 0.001:
                 await asyncio.sleep(sleep_for)
+            while time.perf_counter() < target:
+                await asyncio.sleep(0)
+            sleep_actual_total += time.perf_counter() - t_sleep_start
+
+            tick_count += 1
+            elapsed = time.perf_counter() - t_window_start
+            if elapsed >= 1.0:
+                ms = 1000.0 / tick_count
+                print(
+                    f"[timing] {tick_count:4d} ticks/s  "
+                    f"render {render_total * ms:5.2f}ms  "
+                    f"send {send_total * ms:5.2f}ms  "
+                    f"sleep_req {sleep_req_total * ms:5.2f}ms  "
+                    f"sleep_actual {sleep_actual_total * ms:5.2f}ms",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                render_total = send_total = sleep_req_total = sleep_actual_total = 0.0
+                tick_count = 0
+                t_window_start = time.perf_counter()
     finally:
         reader_task.cancel()
         print("[ws] client disconnected", file=sys.stderr)
@@ -225,28 +270,55 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--debug-state", action="store_true")
     p.add_argument("--no-static", action="store_true", help="Don't serve the viewer HTML.")
     p.add_argument("--jpeg-quality", type=int, default=d.jpeg_quality)
+    p.add_argument("--tick-hz", type=int, default=d.tick_hz,
+                   help="Loop target rate in Hz — one physics step + one render per tick. Default 60.")
     return p
 
 
 def main(argv=None) -> None:
     args = _build_argparser().parse_args(argv)
+    if args.tick_hz <= 0:
+        print("error: --tick-hz must be > 0", file=sys.stderr)
+        sys.exit(2)
     cfg = ServeConfig(
         ckpt=args.ckpt,
         ws_port=args.ws_port,
         static_port=args.static_port,
         debug_state=args.debug_state,
         jpeg_quality=args.jpeg_quality,
+        tick_hz=args.tick_hz,
     )
 
-    if not args.no_static:
-        viewer_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer")
-        _StaticServer(cfg.static_port, viewer_dir).start()
-        print(f"[viewer] open http://localhost:{cfg.static_port}/", file=sys.stderr)
+    # On Windows the default kernel timer resolution (~15 ms) makes
+    # asyncio.sleep ignore sub-15 ms requests, which lets the tick rate cap
+    # leak. timeBeginPeriod(1) requests 1 ms resolution for the duration of
+    # this process; the loop's yield-safety-net handles the residual.
+    winmm = None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            winmm = ctypes.windll.winmm
+            winmm.timeBeginPeriod(1)
+        except Exception as exc:
+            print(f"[serve] warning: couldn't raise Windows timer resolution ({exc})", file=sys.stderr)
+            winmm = None
 
     try:
-        asyncio.run(_run_async(cfg))
-    except KeyboardInterrupt:
-        print("\n[serve] bye", file=sys.stderr)
+        if not args.no_static:
+            viewer_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer")
+            _StaticServer(cfg.static_port, viewer_dir).start()
+            print(f"[viewer] open http://localhost:{cfg.static_port}/", file=sys.stderr)
+
+        try:
+            asyncio.run(_run_async(cfg))
+        except KeyboardInterrupt:
+            print("\n[serve] bye", file=sys.stderr)
+    finally:
+        if winmm is not None:
+            try:
+                winmm.timeEndPeriod(1)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
