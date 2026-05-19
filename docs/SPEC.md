@@ -279,16 +279,17 @@ python scripts/serve.py --ckpt checkpoints/sidescroller_v1.pt
 
 **Windows (CUDA)**:
 ```powershell
-py -3.11 -m venv .venv
+Set-ExecutionPolicy -Scope Process Bypass    # so activate.ps1 can run this session
+py -3 -m venv .venv                          # Python 3.11+ (3.13 tested)
 .venv\Scripts\activate
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 python scripts\capture.py --out data\sidescroller_v1 --n 20000
 python scripts\train.py --data data\sidescroller_v1 --out checkpoints\sidescroller_v1.pt
 python scripts\serve.py --ckpt checkpoints\sidescroller_v1.pt
 ```
 
-Call out: PyTorch on Windows installs from the CUDA index URL; on Mac the default wheel includes MPS. Pygame works headless on both via offscreen Surfaces.
+Call out: PyTorch on Windows installs from the CUDA index URL. Use **cu128** — required for RTX 50-series (Blackwell, sm_120) and the only stable index currently shipping Python 3.13 wheels; works on 30/40/50-series. On Mac the default wheel includes MPS. Pygame works headless on both via offscreen Surfaces.
 
 ---
 
