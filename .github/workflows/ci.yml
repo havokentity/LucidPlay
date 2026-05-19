@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Opt the JS actions (checkout, setup-python) into Node.js 24 ahead of the
+# default switch on 2026-06-02. Removes the deprecation annotation.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   test:
     runs-on: ubuntu-latest
