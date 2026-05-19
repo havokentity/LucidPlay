@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lucidplay"
+version = "0.1.0"
+description = "Tiny neural game engine: a learned PyTorch renderer turns world state into pixels."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Rajesh D'Monte" }]
+keywords = ["pytorch", "neural-renderer", "game-engine", "pygame", "websocket"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Games/Entertainment",
+]
+# Runtime deps stay in requirements.txt as the install source of truth; this
+# list mirrors them for tooling that introspects pyproject.toml.
+dependencies = [
+  "torch>=2.2",
+  "numpy",
+  "pillow",
+  "pygame>=2.5",
+  "websockets>=12",
+  "pytorch-msssim",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-timeout>=2.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/havokentity/LucidPlay"
+Source   = "https://github.com/havokentity/LucidPlay"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --tb=short"
+filterwarnings = [
+  # pygame 2.6.x imports the deprecated pkg_resources; not our problem to fix.
+  "ignore::UserWarning:pygame.pkgdata",
+  "ignore::DeprecationWarning:pkg_resources",
+  # websockets 16 deprecates WebSocketServerProtocol (legacy module). Tracked
+  # separately; physics tests touch game_server which still imports it.
+  "ignore:.*WebSocketServerProtocol is deprecated.*:DeprecationWarning",
+  "ignore:websockets.legacy is deprecated.*:DeprecationWarning",
+]
