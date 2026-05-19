@@ -8,7 +8,8 @@ import os
 import random
 import sys
 import time
-from typing import Optional
+from contextlib import nullcontext
+from typing import Iterable, Iterator, Optional, Tuple
 
 import numpy as np
 import torch
@@ -46,16 +47,58 @@ def _cosine_lr(step: int, total_steps: int, base_lr: float, warmup: int = 500) -
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def _save_preview(model: ConditionalRenderer, val_loader: DataLoader, device: torch.device, out_path: str) -> None:
-    from PIL import Image  # local to avoid hard dep at top
+def _enable_cuda_perf() -> None:
+    # TF32 + cuDNN autotune. fp32-compatible numerically; free perf at fixed shapes.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+
+class _DeviceBatchIter:
+    """Yields fixed-size batches over device-resident tensors. Used with --cache-data."""
+
+    def __init__(self, states: torch.Tensor, frames: torch.Tensor, batch_size: int, shuffle: bool):
+        assert states.size(0) == frames.size(0)
+        self.states = states
+        self.frames = frames
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n = states.size(0)
+
+    def __len__(self) -> int:
+        return self.n // self.batch_size
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        if self.shuffle:
+            idx = torch.randperm(self.n, device=self.states.device)
+        else:
+            idx = torch.arange(self.n, device=self.states.device)
+        for start in range(0, self.n - self.batch_size + 1, self.batch_size):
+            sl = idx[start:start + self.batch_size]
+            yield self.states[sl], self.frames[sl]
+
+
+def _materialize(ds: FrameStateDataset, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    states = []
+    frames = []
+    for i in range(len(ds)):
+        s, f = ds[i]
+        states.append(s)
+        frames.append(f)
+    states_t = torch.stack(states).to(device, non_blocking=True)
+    frames_t = torch.stack(frames).to(device, non_blocking=True)
+    return states_t, frames_t
+
+
+def _save_preview(model, val_loader, device: torch.device, out_path: str) -> None:
+    from PIL import Image
     model.eval()
     states, gts = next(iter(val_loader))
-    states = states[:16].to(device)
-    gts = gts[:16]
+    states = states[:16].to(device, non_blocking=True)
+    gts = gts[:16].detach().cpu()
     with torch.inference_mode():
-        preds = model(states).cpu().clamp(0, 1)
+        preds = model(states).clamp(0, 1).detach().float().cpu()
     n = preds.size(0)
-    # 4x4 grid of (pred above, gt below) — stack vertically per cell.
     rows, cols = 4, 4
     cell_w, cell_h = FRAME_W, FRAME_H * 2
     grid = Image.new("RGB", (cols * cell_w, rows * cell_h))
@@ -71,7 +114,7 @@ def _save_preview(model: ConditionalRenderer, val_loader: DataLoader, device: to
     model.train()
 
 
-def _validate(model: ConditionalRenderer, val_loader: DataLoader, device: torch.device) -> float:
+def _validate(model, val_loader, device: torch.device) -> float:
     model.eval()
     total = 0.0
     n = 0
@@ -79,8 +122,8 @@ def _validate(model: ConditionalRenderer, val_loader: DataLoader, device: torch.
         for states, gts in val_loader:
             states = states.to(device, non_blocking=True)
             gts = gts.to(device, non_blocking=True)
-            preds = model(states)
-            total += F.l1_loss(preds, gts, reduction="sum").item()
+            preds = model(states).float()
+            total += F.l1_loss(preds, gts.float(), reduction="sum").item()
             n += gts.numel()
     model.train()
     return total / max(1, n)
@@ -89,26 +132,64 @@ def _validate(model: ConditionalRenderer, val_loader: DataLoader, device: torch.
 def run(cfg: TrainConfig) -> None:
     _set_seed(cfg.seed)
     device = pick_device()
+    if device.type == "cuda":
+        _enable_cuda_perf()
     pin = pin_memory_for(device)
-    print(f"[train] device={device}  pin_memory={pin}", file=sys.stderr)
+
+    use_amp = cfg.amp and device.type == "cuda"
+    use_compile = cfg.torch_compile and device.type == "cuda"
+    if cfg.amp and not use_amp:
+        print(f"[train] --amp ignored on device={device.type}; bf16 autocast is CUDA-only here.", file=sys.stderr)
+    if cfg.torch_compile and not use_compile:
+        print(f"[train] --compile ignored on device={device.type}; torch.compile path is CUDA-only here.", file=sys.stderr)
+
+    print(
+        f"[train] device={device}  pin_memory={pin}  cache={cfg.cache_data}  "
+        f"amp={use_amp}  compile={use_compile}  channels_last={cfg.channels_last}",
+        file=sys.stderr,
+    )
 
     train_ds = FrameStateDataset(cfg.data_dir, split="train", val_frac=cfg.val_frac)
     val_ds = FrameStateDataset(cfg.data_dir, split="val", val_frac=cfg.val_frac)
     print(f"[train] train={len(train_ds)} val={len(val_ds)}", file=sys.stderr)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=pin, drop_last=True, persistent_workers=cfg.num_workers > 0,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=max(0, cfg.num_workers // 2), pin_memory=pin,
-    )
+    train_loader: Iterable
+    val_loader: Iterable
+    if cfg.cache_data:
+        t0 = time.time()
+        train_states, train_frames = _materialize(train_ds, device)
+        val_states, val_frames = _materialize(val_ds, device)
+        if cfg.channels_last:
+            train_frames = train_frames.to(memory_format=torch.channels_last)
+            val_frames = val_frames.to(memory_format=torch.channels_last)
+        bytes_total = sum(
+            t.element_size() * t.nelement()
+            for t in (train_states, train_frames, val_states, val_frames)
+        )
+        print(
+            f"[train] cached {len(train_ds) + len(val_ds)} samples on {device} "
+            f"({bytes_total / 1e6:.1f} MB) in {time.time() - t0:.1f}s",
+            file=sys.stderr,
+        )
+        train_loader = _DeviceBatchIter(train_states, train_frames, cfg.batch_size, shuffle=True)
+        val_loader = _DeviceBatchIter(val_states, val_frames, cfg.batch_size, shuffle=False)
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=cfg.batch_size, shuffle=True,
+            num_workers=cfg.num_workers, pin_memory=pin, drop_last=True,
+            persistent_workers=cfg.num_workers > 0,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=cfg.batch_size, shuffle=False,
+            num_workers=max(0, cfg.num_workers // 2), pin_memory=pin,
+        )
 
-    model = ConditionalRenderer().to(device)
-    print(f"[train] params={num_params(model):,}", file=sys.stderr)
+    raw_model = ConditionalRenderer().to(device)
+    if cfg.channels_last:
+        raw_model = raw_model.to(memory_format=torch.channels_last)
+    print(f"[train] params={num_params(raw_model):,}", file=sys.stderr)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    opt = torch.optim.AdamW(raw_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     MS_SSIM_cls = _try_import_msssim()
     ms_ssim_module = None
@@ -125,13 +206,23 @@ def run(cfg: TrainConfig) -> None:
     best_val = float("inf")
     if cfg.resume and os.path.isfile(cfg.resume):
         ckpt = torch.load(cfg.resume, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        raw_model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
         start_step = int(ckpt.get("step", 0))
         best_val = float(ckpt.get("best_val", best_val))
         print(f"[train] resumed from {cfg.resume} at step {start_step}", file=sys.stderr)
 
+    # Compile after resume load so the saved state_dict keys match raw_model.
+    model = torch.compile(raw_model) if use_compile else raw_model
+    if use_compile:
+        print("[train] torch.compile(model) enabled — first ~10 steps will be slow.", file=sys.stderr)
+
     os.makedirs(os.path.dirname(cfg.out_ckpt) or ".", exist_ok=True)
+
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_amp else nullcontext()
+    )
 
     model.train()
     step = start_step
@@ -149,18 +240,20 @@ def run(cfg: TrainConfig) -> None:
 
         states = states.to(device, non_blocking=True)
         gts = gts.to(device, non_blocking=True)
+        if cfg.channels_last and gts.dim() == 4:
+            gts = gts.to(memory_format=torch.channels_last)
 
-        # LR schedule (cosine with linear warmup).
         lr_now = _cosine_lr(step, cfg.steps, cfg.lr)
         for pg in opt.param_groups:
             pg["lr"] = lr_now
 
-        preds = model(states)
-        l1 = F.l1_loss(preds, gts)
+        with amp_ctx:
+            preds = model(states)
+            l1 = F.l1_loss(preds, gts)
         if ms_ssim_module is not None:
-            # MS_SSIM returns similarity ∈ [0,1]; loss = 1 - similarity.
-            ssim_loss = 1.0 - ms_ssim_module(preds, gts)
-            loss = l1 + cfg.msssim_weight * ssim_loss
+            # MS-SSIM uses ops that don't reliably autocast; compute in fp32 explicitly.
+            ssim_loss = 1.0 - ms_ssim_module(preds.float(), gts.float())
+            loss = l1.float() + cfg.msssim_weight * ssim_loss
         else:
             loss = l1
 
@@ -168,7 +261,7 @@ def run(cfg: TrainConfig) -> None:
         loss.backward()
         opt.step()
 
-        running += float(l1.item())
+        running += float(l1.detach().float().item())
         running_n += 1
         step += 1
 
@@ -188,7 +281,7 @@ def run(cfg: TrainConfig) -> None:
             print(f"[val ] step {step:6d}  val_l1 {val_l1:.4f}", file=sys.stderr)
             if val_l1 < best_val:
                 best_val = val_l1
-                _save_checkpoint(cfg.out_ckpt + ".best", model, opt, step, best_val)
+                _save_checkpoint(cfg.out_ckpt + ".best", raw_model, opt, step, best_val)
 
         if step % cfg.preview_every == 0:
             preview_path = os.path.join(
@@ -201,9 +294,9 @@ def run(cfg: TrainConfig) -> None:
                 print(f"[train] preview failed: {exc}", file=sys.stderr)
 
         if step % cfg.ckpt_every == 0:
-            _save_checkpoint(cfg.out_ckpt, model, opt, step, best_val)
+            _save_checkpoint(cfg.out_ckpt, raw_model, opt, step, best_val)
 
-    _save_checkpoint(cfg.out_ckpt, model, opt, step, best_val)
+    _save_checkpoint(cfg.out_ckpt, raw_model, opt, step, best_val)
     print(f"[train] done. final step {step}  best_val_l1 {best_val:.4f}", file=sys.stderr)
 
 
@@ -237,6 +330,17 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num-workers", type=int, default=d.num_workers)
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--resume", default=d.resume)
+    # Perf flags. Defaults preserve spec-compliant fp32 behavior.
+    p.add_argument("--cache-data", action="store_true", default=d.cache_data,
+                   help="Pre-decode entire dataset into device memory. Bypasses DataLoader workers.")
+    p.add_argument("--amp", action="store_true", default=d.amp,
+                   help="bf16 autocast on forward+L1 (CUDA only; ignored on MPS/CPU).")
+    p.add_argument("--compile", dest="torch_compile", action="store_true", default=d.torch_compile,
+                   help="torch.compile the model (CUDA only; ignored on MPS/CPU).")
+    p.add_argument("--channels-last", action="store_true", default=d.channels_last,
+                   help="NHWC memory format. Opt-in; can regress on MPS.")
+    p.add_argument("--fast", action="store_true", default=False,
+                   help="Shortcut: --cache-data + --amp + --compile (amp/compile auto-disabled on non-CUDA).")
     return p
 
 
@@ -256,6 +360,10 @@ def main(argv: Optional[list] = None) -> None:
         num_workers=args.num_workers,
         seed=args.seed,
         resume=args.resume,
+        cache_data=args.cache_data or args.fast,
+        amp=args.amp or args.fast,
+        torch_compile=args.torch_compile or args.fast,
+        channels_last=args.channels_last,
     )
     run(cfg)
 

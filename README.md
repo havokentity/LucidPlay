@@ -75,6 +75,27 @@ python scripts/serve.py  --ckpt checkpoints/sidescroller_v1.pt
 200 frames at 200 steps won't look like much, but it proves the pipeline runs
 end-to-end on whatever device you've got.
 
+## Training perf flags
+
+Defaults preserve the spec's fp32 / no-compile recipe and run on every device.
+The flags below opt into bigger wins. CUDA-only flags warn and skip on MPS/CPU.
+
+| Flag              | Effect                                                                                          | Devices       |
+|-------------------|-------------------------------------------------------------------------------------------------|---------------|
+| `--cache-data`    | Pre-decodes the whole dataset into device memory; skips DataLoader workers and per-step H2D.    | Any           |
+| `--amp`           | bf16 autocast on the model forward + L1 loss. MS-SSIM stays fp32.                               | CUDA only     |
+| `--compile`       | `torch.compile(model)`. First ~10 steps slow, then fused kernels.                               | CUDA only     |
+| `--channels-last` | NHWC memory format on model + frame tensors. Can regress on MPS — measure before keeping.       | Any (opt-in)  |
+| `--fast`          | Shortcut: `--cache-data --amp --compile` (amp/compile auto-disabled on non-CUDA).               | Any           |
+
+TF32 matmul + `cudnn.benchmark` are turned on automatically when CUDA is the
+active device — they're fp32-compatible and free at our fixed 160×96 shape.
+
+On a 5090: start with `--fast` and consider bumping `--batch-size` (default 32
+leaves the card mostly idle). On M4 Max: `--cache-data` alone is the main win;
+note the cached dataset lives in unified memory, costing ~1 GB at the default
+20 k frames.
+
 ## How it works
 
 1. **Capture** (`scripts/capture.py`). A scripted random agent walks the level,
