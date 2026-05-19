@@ -31,14 +31,18 @@ state → ConditionalRenderer → image → WebSocket → <canvas>
 ### Mac (Apple Silicon, MPS)
 
 ```bash
-python3.11 -m venv .venv
+python3.11 -m venv .venv     # or python3.12 — both work
 source .venv/bin/activate
 pip install -r requirements.txt
 python scripts/capture.py --out data/sidescroller_v1 --n 20000
-python scripts/train.py  --data data/sidescroller_v1 --out checkpoints/sidescroller_v1.pt
+python scripts/train.py  --data data/sidescroller_v1 --out checkpoints/sidescroller_v1.pt --cache-data
 python scripts/serve.py  --ckpt checkpoints/sidescroller_v1.pt
 # open http://localhost:8000 in any browser
 ```
+
+`--cache-data` preloads the dataset into unified memory and skips DataLoader
+overhead per step — typically 10–20 % faster on MPS. The CUDA-only flags
+(`--amp`, `--compile`) are no-ops here.
 
 ### Windows (NVIDIA CUDA)
 
@@ -49,7 +53,7 @@ py -3 -m venv .venv                          # Python 3.11+ (3.13 tested)
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 python scripts\capture.py --out data\sidescroller_v1 --n 20000
-python scripts\train.py  --data data\sidescroller_v1 --out checkpoints\sidescroller_v1.pt
+python scripts\train.py  --data data\sidescroller_v1 --out checkpoints\sidescroller_v1.pt --fast
 python scripts\serve.py  --ckpt checkpoints\sidescroller_v1.pt
 ```
 
@@ -63,6 +67,11 @@ python scripts\serve.py  --ckpt checkpoints\sidescroller_v1.pt
 > ```powershell
 > python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 > ```
+
+The `--fast` flag bundles `--cache-data --amp --compile` — on a 5090 a full
+50k-step run lands around **2–4 minutes** (vs ~57 min on Apple Silicon MPS).
+Once you've verified it works you can also bump `--batch-size 128` — the 5090
+has plenty of VRAM headroom at 160×96.
 
 ### Smoke test on tiny data
 
@@ -128,6 +137,34 @@ and a global time channel for parallax/clouds.
 Val L1 < ~0.05 on the held-out 5% split is the rough "looks like a side-scroller"
 threshold. Eyeball the preview grids — this is a POC, not SOTA.
 
+## Convergence is stochastic — don't be surprised by run-to-run differences
+
+Training the renderer is not a deterministic process across machines, even with
+seeds:
+
+- **fp32 isn't bit-exact across devices.** CUDA, MPS, and CPU use different
+  matmul / reduction kernels. Over 50k steps the tiny per-op differences
+  accumulate into very different final weights.
+- **DataLoader workers differ by OS** (default 4 on Windows, 2 on Mac), which
+  changes batch ordering even with the same seed.
+- **The loss landscape has many local minima.** Two runs with different
+  initializations can land in basins whose visible quality differs noticeably.
+
+In practice this means the same code + same data + same seed on Windows vs Mac
+can produce one model that renders jumps perfectly and one that drops the
+player mid-air. With v1's mode mix (~35% airborne frames) it's much less
+common, but if your run looks broken on some state, **re-run with
+`--seed 1`**. It's the standard cheap fix.
+
+```powershell
+python scripts\train.py --data data\sidescroller_v1 --out checkpoints\sidescroller_v1.pt --fast --seed 1
+```
+
+The `checkpoints/preview_*.jpg` grids saved every 1000 steps are the fastest
+sanity check — each cell shows (prediction top / ground truth bottom). If the
+top row is missing the player while the bottom shows it, that's the failure
+mode this section is talking about.
+
 ## Out of scope for v1 (v2 ideas)
 
 - Enemies, projectiles, full collision.
@@ -141,9 +178,30 @@ threshold. Eyeball the preview grids — this is a POC, not SOTA.
 ## Notes on portability
 
 - No `tiny-cuda-nn`, no custom CUDA kernels, no `gsplat`. Plain PyTorch ops.
-- fp32 only in v1. No `torch.compile`, no `.half()` — MPS support is uneven.
+- Default training is fp32 on every device — spec-compliant and portable.
+  CUDA-only perf flags (`--amp`, `--compile`) are opt-in and gate themselves
+  off on MPS / CPU so the same command works on every machine.
 - Pygame **never** calls `pygame.display.set_mode`. `SDL_VIDEODRIVER=dummy` is
   forced in `src/scene.py` before `import pygame`.
+
+### Re-training after a code update
+
+If you've already trained on an older `main` and pulled new changes, the
+capture distribution may have changed too. The simplest reset:
+
+```powershell
+# Windows
+Remove-Item -Recurse -Force data\sidescroller_v1, checkpoints
+python scripts\capture.py --out data\sidescroller_v1 --n 20000
+python scripts\train.py  --data data\sidescroller_v1 --out checkpoints\sidescroller_v1.pt --fast
+```
+
+```bash
+# Mac
+rm -rf data/sidescroller_v1 checkpoints
+python scripts/capture.py --out data/sidescroller_v1 --n 20000
+python scripts/train.py  --data data/sidescroller_v1 --out checkpoints/sidescroller_v1.pt --cache-data
+```
 
 ## License
 
